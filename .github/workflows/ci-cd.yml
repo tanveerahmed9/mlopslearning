@@ -1,0 +1,110 @@
+name: CI/CD — Sentiment Analyzer
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "task1_sentiment_analyzer/**"
+  pull_request:
+    branches: [main]
+    paths:
+      - "task1_sentiment_analyzer/**"
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/sentiment-analyzer
+
+jobs:
+  # ────────────────────────────────────────────
+  # CI: Build & smoke-test the image
+  # Runs on every push and PR
+  # ────────────────────────────────────────────
+  ci:
+    name: Build & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            -t sentiment-analyzer:ci \
+            task1_sentiment_analyzer/
+
+      - name: Smoke test — health check
+        run: |
+          docker run -d --name sa-test -p 8000:8000 sentiment-analyzer:ci
+          # wait for the model to load
+          for i in $(seq 1 12); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/health || true)
+            if [ "$STATUS" = "200" ]; then echo "Service is up"; break; fi
+            echo "Waiting... ($i/12)"
+            sleep 10
+          done
+          curl -sf http://localhost:8000/health
+
+      - name: Smoke test — prediction
+        run: |
+          RESPONSE=$(curl -sf -X POST http://localhost:8000/predict \
+            -H "Content-Type: application/json" \
+            -d '{"text": "CI pipeline works great!"}')
+          echo "$RESPONSE"
+          echo "$RESPONSE" | python3 -c "
+          import sys, json
+          r = json.load(sys.stdin)
+          assert r['label'] in ('POSITIVE', 'NEGATIVE'), 'unexpected label'
+          assert 0 <= r['score'] <= 1, 'score out of range'
+          print('Prediction test passed')
+          "
+
+      - name: Cleanup test container
+        if: always()
+        run: docker rm -f sa-test || true
+
+  # ────────────────────────────────────────────
+  # CD: Push image to GHCR + deploy to k3d
+  # Runs only on push to main (not PRs)
+  # ────────────────────────────────────────────
+  cd:
+    name: Push & Deploy
+    runs-on: self-hosted        # your local machine with k3d
+    needs: ci
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push image
+        uses: docker/build-push-action@v6
+        with:
+          context: task1_sentiment_analyzer/
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:latest
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+      - name: Import image into k3d
+        run: |
+          k3d image import ${{ env.IMAGE_NAME }}:${{ github.sha }} -c gooperator
+
+      - name: Update deployment image
+        run: |
+          kubectl set image deployment/sentiment-analyzer \
+            sentiment-analyzer=${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/sentiment-analyzer --timeout=120s
+
+      - name: Verify deployment
+        run: |
+          kubectl get pods -l app=sentiment-analyzer
